@@ -1,18 +1,206 @@
-# Copyright 2022 The TensorFlow Recommenders Authors.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
-# Lint-as: python3
+class TopK(tf.keras.Model, abc.ABC):
+  """Interface for top K layers.
+
+  Implementers must provide the following two methods:
+
+  1. `index`: takes a tensor of candidate embeddings and creates the retrieval
+    index.
+  2. `call`: takes a tensor of queries and returns top K candidates for those
+    queries.
+  """
+
+  def __init__(self, k: int, **kwargs) -> None:
+    """Initializes the base class."""
+
+    super().__init__(**kwargs)
+    self._k = k
+
+  @abc.abstractmethod
+  def index(
+      self,
+      candidates: tf.Tensor,
+      identifiers: Optional[tf.Tensor] = None) -> "TopK":
+    """Builds the retrieval index.
+
+    When called multiple times the existing index will be dropped and a new one
+    created.
+
+    Args:
+      candidates: Matrix of candidate embeddings.
+      identifiers: Optional tensor of candidate identifiers. If
+        given, these will be used as identifiers of top candidates returned
+        when performing searches. If not given, indices into the candidates
+        tensor will be returned instead.
+
+    Returns:
+      Self.
+    """
+
+    raise NotImplementedError()
+
+  def index_from_dataset(
+      self,
+      candidates: tf.data.Dataset
+  ) -> "TopK":
+    """Builds the retrieval index.
+
+    When called multiple times the existing index will be dropped and a new one
+    created.
+
+    Args:
+      candidates: Dataset of candidate embeddings or (candidate identifier,
+        candidate embedding) pairs. If the dataset returns tuples,
+        the identifiers will be used as identifiers of top candidates
+        returned when performing searches. If not given, indices into the
+        candidates dataset will be given instead.
+
+    Returns:
+      Self.
+
+    Raises:
+      ValueError if the dataset does not have the correct structure.
+    """
+
+    _check_candidates_with_identifiers(candidates)
+
+    spec = candidates.element_spec
+
+    if isinstance(spec, tuple):
+      identifiers_and_candidates = list(candidates)
+      candidates = tf.concat(
+          [embeddings for _, embeddings in identifiers_and_candidates],
+          axis=0
+      )
+      identifiers = tf.concat(
+          [identifiers for identifiers, _ in identifiers_and_candidates],
+          axis=0
+      )
+    else:
+      candidates = tf.concat(list(candidates), axis=0)
+      identifiers = None
+
+    return self.index(candidates, identifiers)
+
+  @abc.abstractmethod
+  def call(
+      self,
+      queries: Union[tf.Tensor, Dict[Text, tf.Tensor]],
+      k: Optional[int] = None,
+  ) -> Tuple[tf.Tensor, tf.Tensor]:
+    """Query the index.
+
+    Args:
+      queries: Query features. If `query_model` was provided in the constructor,
+        these can be raw query features that will be processed by the query
+        model before performing retrieval. If `query_model` was not provided,
+        these should be pre-computed query embeddings.
+      k: The number of candidates to retrieve. If not supplied, defaults to the
+        `k` value supplied in the constructor.
+
+    Returns:
+      Tuple of (top candidate scores, top candidate identifiers).
+
+    Raises:
+      ValueError if `index` has not been called.
+    """
+
+    raise NotImplementedError()
+
+  @tf.function
+  def query_with_exclusions(
+      self,
+      queries: Union[tf.Tensor, Dict[Text, tf.Tensor]],
+      exclusions: tf.Tensor,
+      k: Optional[int] = None,
+  ) -> Tuple[tf.Tensor, tf.Tensor]:
+    """Query the index.
+
+    Args:
+      queries: Query features. If `query_model` was provided in the constructor,
+        these can be raw query features that will be processed by the query
+        model before performing retrieval. If `query_model` was not provided,
+        these should be pre-computed query embeddings.
+      exclusions: `[query_batch_size, num_to_exclude]` tensor of identifiers to
+        be excluded from the top-k calculation. This is most commonly used to
+        exclude previously seen candidates from retrieval. For example, if a
+        user has already seen items with ids "42" and "43", you could set
+        exclude to `[["42", "43"]]`.
+      k: The number of candidates to retrieve. Defaults to constructor `k`
+        parameter if not supplied.
+
+    Returns:
+      Tuple of (top candidate scores, top candidate identifiers).
+
+    Raises:
+      ValueError if `index` has not been called.
+      ValueError if `queries` is not a tensor (after being passed through
+        the query model).
+    """
+
+    # Ideally, `exclusions` would simply be an optional parameter to
+    # `call`. However, Keras is unable to handle `call` signatures
+    # that have more than one Tensor input parameter. The alternative
+    # is to either pack all inputs into the first positional argument
+    # (via tuples or dicts), or else have a separate method. We opt
+    # for the second solution here. The ergonomics in either case aren't
+    # great, but having two methods is simpler to explain.
+    # See https://github.com/tensorflow/tensorflow/blob/v2.4.0/tensorflow/
+    # python/keras/engine/base_layer.py#L942 for details of why Keras
+    # puts us in this predicament.
+
+    k = k if k is not None else self._k
+
+    adjusted_k = k + exclusions.shape[1]
+    x, y = self(queries=queries, k=adjusted_k)
+    return _exclude(x, y, exclude=exclusions, k=k)
+
+  @abc.abstractmethod
+  def is_exact(self) -> bool:
+    """Indicates whether the results returned by the layer are exact.
+
+    Some layers may return approximate scores: for example, the ScaNN layer
+    may return approximate results.
+
+    Returns:
+      True if the layer returns exact results, and False otherwise.
+    """
+
+    raise NotImplementedError()
+
+  def _reset_tf_function_cache(self):
+    """Resets the tf.function cache.
+
+    We need to invalidate the compiled tf.function cache here. We just
+    dropped some variables and created new ones. The concrete function is
+    still referring to the old ones - and because it only holds weak
+    references, this does not prevent the old variables being garbage
+    collected. The end result is that it references dead objects.
+    To resolve this, we throw away the existing tf.function object and
+    create a new one.
+    """
+
+    if hasattr(self.query_with_exclusions, "python_function"):
+      self.query_with_exclusions = tf.function(
+          self.query_with_exclusions.python_function)
+
+  def _compute_score(self, queries: tf.Tensor,
+                     candidates: tf.Tensor) -> tf.Tensor:
+    """Computes the standard dot product score from queries and candidates.
+
+    Args:
+      queries: Tensor of queries for which the candidates are to be retrieved.
+      candidates: Tensor of candidate embeddings.
+
+    Returns:
+      The dot product of queries and candidates.
+    """
+
+    return tf.matmul(queries, candidates, transpose_b=True)
+
+
+
+
 """Layers related to loss computation."""
 from typing import Tuple
 
