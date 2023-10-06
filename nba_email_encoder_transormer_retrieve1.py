@@ -99,31 +99,19 @@ def run_experiment(params,
                                                         target_label=target_label)
 
         dataset_train = dataset_train.map(mapping['train'])
-        # check.append(dataset_train)
+
         dataset_test = dataset_test.map(mapping['test'])
         print('finished creating sets')
 
 
 
-        # metrics = FactorizedTopKCustom(
-        # candidates = dataset_candidates.batch(500).map(utm_model)
-        # )
         metrics = tfrs.metrics.FactorizedTopK(
         candidates = dataset_candidates.batch(500).map(encoders['utm_model'])
         )
         task = RetrievalCustom(
         metrics=metrics,
-        # num_hard_negatives = 10,
-        fixed_library_embeddings = next(iter(dataset_candidates.batch(500).map(encoders['utm_model'])))
+        fixed_library_embeddings = dataset_candidates
         )   
-
-        # metrics = tfrs.metrics.FactorizedTopK(
-        # candidates = dataset_candidates.batch(500).map(utm_model)
-        # )
-        # task = tfrs.tasks.Retrieval(
-        # metrics=metrics,
-        # num_hard_negatives = 10
-        # ) 
 
         model = retrievalModel(encoders['user_model'], encoders['utm_model'], task)
 
@@ -137,14 +125,6 @@ def run_experiment(params,
         callback_list = [early, tensorboard_callback]
 
 
-        print("Start training the model...")        
-        print(f'num_epochs {num_epochs}')
-        print(f'learning_rate {learning_rate}')
-        print(f'weight_decay {weight_decay}')
-        print(f'batch_size {batch_size}')
-        print(f'train_size {train_size}')
-        print(f'train_size {test_size}')
-
         hist = model.fit(
             dataset_train,
             epochs=params["num_epochs"],
@@ -153,9 +133,7 @@ def run_experiment(params,
             steps_per_epoch=train_size//batch_size,
             validation_steps=(test_size // batch_size)
         )
-      
-        print("Model training finished")
-        print(hist.history)
+     
         loss = hist.history['loss'][-1]
         print(f"Validation loss: {round(loss * 100, 2)}%")
 
@@ -252,13 +230,6 @@ print(best_params)
 
 
 
-
-from tensorflow_recommenders.tasks import base
-from typing import Optional, Sequence, Union, Text, List
-from tensorflow_recommenders import layers
-from tensorflow_recommenders import metrics as tfrs_metrics
-import abc
-
 class RetrievalCustom(tf.keras.layers.Layer, base.Task):
   """A factorized retrieval task.
 
@@ -275,7 +246,7 @@ class RetrievalCustom(tf.keras.layers.Layer, base.Task):
   """
 
   def __init__(self,
-               fixed_library_embeddings: Union[layers.factorized_top_k.TopK, tf.data.Dataset],
+               fixed_library_dataset=None,
                loss: Optional[tf.keras.losses.Loss] = None,
                metrics: Optional[Union[
                    Sequence[tfrs_metrics.Factorized],
@@ -305,7 +276,7 @@ class RetrievalCustom(tf.keras.layers.Layer, base.Task):
     self._temperature = temperature
     self._num_hard_negatives = num_hard_negatives
     self._remove_accidental_hits = remove_accidental_hits
-    self._fixed_library_embeddings = fixed_library_embeddings
+    self._fixed_library_dataset = fixed_library_dataset
 
   @property
   def factorized_metrics(self) -> Optional[
@@ -328,26 +299,29 @@ class RetrievalCustom(tf.keras.layers.Layer, base.Task):
     self._factorized_metrics = value
   def _get_labels_for_fixed_library(self, candidate_embeddings):
     # Compute similarity between batch candidate embeddings and fixed library embeddings
-    similarity = tf.linalg.matmul(candidate_embeddings, self._fixed_library_embeddings, transpose_b=True)
+    similarity = tf.linalg.matmul(candidate_embeddings, self.fixed_library_embeddings_materialized, transpose_b=True)
     
     # For each query, find the index of its true candidate in the fixed library
     indices = tf.math.argmax(similarity, axis=1)
 
     # Construct the labels matrix
-    labels = tf.one_hot(indices, depth=tf.shape(self._fixed_library_embeddings)[0])
+    labels = tf.one_hot(indices, depth=tf.shape(self.fixed_library_embeddings_materialized)[0])
 
     return labels
-  def call(self,
+  def call(self,utm_model_encoder,
            query_embeddings: tf.Tensor,
            candidate_embeddings: tf.Tensor,
            sample_weight: Optional[tf.Tensor] = None,
            candidate_sampling_probability: Optional[tf.Tensor] = None,
            candidate_ids: Optional[tf.Tensor] = None,
            compute_metrics: bool = True,
-           compute_batch_metrics: bool = True) -> tf.Tensor:
+           compute_batch_metrics: bool = True ) -> tf.Tensor:
   
+    
+    self.fixed_library_embeddings_materialized = next(iter(self._fixed_library_dataset.batch(500).map(utm_model)))
+
     # Compute similarity with the fixed library
-    similarity_with_library = tf.linalg.matmul(query_embeddings, self._fixed_library_embeddings, transpose_b=True)
+    similarity_with_library = tf.linalg.matmul(query_embeddings, self.fixed_library_embeddings_materialized, transpose_b=True)
     # print('similarity_with_library ', similarity_with_library.shape())
 
     # Get the labels for the fixed library based on the true candidates from the batch
@@ -359,7 +333,7 @@ class RetrievalCustom(tf.keras.layers.Layer, base.Task):
     num_queries = tf.shape(labels_for_fixed_library)[0]
     num_candidates = tf.shape(labels_for_fixed_library)[1]
 
-
+   
     if self._temperature is not None:
       scores = scores / self._temperature
 
@@ -380,7 +354,7 @@ class RetrievalCustom(tf.keras.layers.Layer, base.Task):
           scores,
           labels)
 
-    update_ops = []
+   update_ops = []
     for metric in self._loss_metrics:
       update_ops.append(
           metric.update_state(loss, sample_weight=sample_weight))
@@ -396,7 +370,6 @@ class RetrievalCustom(tf.keras.layers.Layer, base.Task):
                 true_candidate_ids=candidate_ids)
         )
 
-   
     if compute_batch_metrics:
       for metric in self._batch_metrics:
         update_ops.append(metric.update_state(labels, scores))
