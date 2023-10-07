@@ -22,7 +22,8 @@ class retrievalModel(tf.keras.Model):
       positive_utm_embeddings = self.utm_model(inputs)
     #   print('user_embeddings: ', user_embeddings)
     #   print('positive_utm_embeddings: ', positive_utm_embeddings)
-      loss = self.task(user_embeddings, positive_utm_embeddings,compute_metrics=True)
+      fixed_library = next(iter(self.task._fixed_library_dataset.batch(500).map(self.utm_model)))
+      loss = self.task(fixed_library, user_embeddings, positive_utm_embeddings,compute_metrics=False)
 
       # Handle regularization losses as well.
       regularization_loss = sum(self.losses)
@@ -47,7 +48,7 @@ class retrievalModel(tf.keras.Model):
     except:
         user_embeddings = self.user_model(inputs)
     positive_utm_embeddings = self.utm_model(inputs)
-    loss = self.task(user_embeddings, positive_utm_embeddings,compute_metrics=True)
+    loss = self.task(user_embeddings, positive_utm_embeddings,compute_metrics=False)
 
     # Handle regularization losses as well.
     regularization_loss = sum(self.losses)
@@ -60,6 +61,7 @@ class retrievalModel(tf.keras.Model):
     metrics["total_loss"] = total_loss
 
     return metrics
+
 
 
 
@@ -245,7 +247,7 @@ class RetrievalCustom(tf.keras.layers.Layer, base.Task):
   scoring function.
   """
 
-  def __init__(self,
+def __init__(self,
                fixed_library_dataset=None,
                loss: Optional[tf.keras.losses.Loss] = None,
                metrics: Optional[Union[
@@ -297,16 +299,17 @@ class RetrievalCustom(tf.keras.layers.Layer, base.Task):
       value = []
 
     self._factorized_metrics = value
-  def _get_labels_for_fixed_library(self, candidate_embeddings):
+                           
+  def _get_labels_for_fixed_library(self, candidate_embeddings, fixed_library_embeddings_materialized):
     # Compute similarity between batch candidate embeddings and fixed library embeddings
-    similarity = tf.linalg.matmul(candidate_embeddings, self.fixed_library_embeddings_materialized, transpose_b=True)
+    similarity = tf.linalg.matmul(candidate_embeddings, fixed_library_embeddings_materialized, transpose_b=True)
     
     # For each query, find the index of its true candidate in the fixed library
     indices = tf.math.argmax(similarity, axis=1)
 
     # Construct the labels matrix
-    labels = tf.one_hot(indices, depth=tf.shape(self.fixed_library_embeddings_materialized)[0])
-
+    labels = tf.one_hot(indices, depth=tf.shape(fixed_library_embeddings_materialized)[0])
+    
     return labels
   def call(self,utm_model_encoder,
            query_embeddings: tf.Tensor,
@@ -318,17 +321,15 @@ class RetrievalCustom(tf.keras.layers.Layer, base.Task):
            compute_batch_metrics: bool = True ) -> tf.Tensor:
   
     
-    self.fixed_library_embeddings_materialized = next(iter(self._fixed_library_dataset.batch(500).map(utm_model)))
-
-    # Compute similarity with the fixed library
-    similarity_with_library = tf.linalg.matmul(query_embeddings, self.fixed_library_embeddings_materialized, transpose_b=True)
+    similarity_with_library = tf.linalg.matmul(query_embeddings, fixed_library_embeddings_materialized, transpose_b=True)
     # print('similarity_with_library ', similarity_with_library.shape())
 
     # Get the labels for the fixed library based on the true candidates from the batch
-    labels_for_fixed_library = self._get_labels_for_fixed_library(candidate_embeddings)
+    labels_for_fixed_library = self._get_labels_for_fixed_library(candidate_embeddings, fixed_library_embeddings_materialized)
 
     # Compute the loss
     loss = self._loss(y_true=labels_for_fixed_library, y_pred=similarity_with_library)
+
 
     num_queries = tf.shape(labels_for_fixed_library)[0]
     num_candidates = tf.shape(labels_for_fixed_library)[1]
