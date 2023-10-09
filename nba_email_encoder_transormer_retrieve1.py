@@ -22,7 +22,10 @@ class retrievalModel(tf.keras.Model):
       positive_utm_embeddings = self.utm_model(inputs)
     #   print('user_embeddings: ', user_embeddings)
     #   print('positive_utm_embeddings: ', positive_utm_embeddings)
-      fixed_library = next(iter(self.task._fixed_library_dataset.batch(500).map(self.utm_model)))
+
+      fixed_library = next(iter(self.task._fixed_library_dataset.batch(473).map(self.utm_model)))
+    #   fixed_library = self.task._fixed_library_dataset.map(self.utm_model).reduce(initial_state=tf.constant([]), reduce_func=lambda state, value: tf.concat([state, value], axis=0))
+
       loss = self.task(fixed_library, user_embeddings, positive_utm_embeddings,compute_metrics=False)
 
       # Handle regularization losses as well.
@@ -31,6 +34,10 @@ class retrievalModel(tf.keras.Model):
       total_loss = loss + regularization_loss
 
     gradients = tape.gradient(total_loss, self.trainable_variables)
+    # Check if gradients are None for any variable
+    # for grad, var in zip(gradients, self.trainable_variables):
+    #     if grad is None:
+    #         print(f"No gradient for {var.name}")
     self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
 
     metrics = {metric.name: metric.result() for metric in self.metrics}
@@ -48,7 +55,10 @@ class retrievalModel(tf.keras.Model):
     except:
         user_embeddings = self.user_model(inputs)
     positive_utm_embeddings = self.utm_model(inputs)
-    loss = self.task(user_embeddings, positive_utm_embeddings,compute_metrics=False)
+
+    fixed_library = next(iter(self.task._fixed_library_dataset.batch(473).map(self.utm_model)))
+
+    loss = self.task(fixed_library, user_embeddings, positive_utm_embeddings,compute_metrics=False)
 
     # Handle regularization losses as well.
     regularization_loss = sum(self.losses)
@@ -61,7 +71,6 @@ class retrievalModel(tf.keras.Model):
     metrics["total_loss"] = total_loss
 
     return metrics
-
 
 
 
@@ -101,19 +110,31 @@ def run_experiment(params,
                                                         target_label=target_label)
 
         dataset_train = dataset_train.map(mapping['train'])
-
+        # check.append(dataset_train)
         dataset_test = dataset_test.map(mapping['test'])
         print('finished creating sets')
 
 
 
+        # metrics = FactorizedTopKCustom(
+        # candidates = dataset_candidates.batch(500).map(utm_model)
+        # )
         metrics = tfrs.metrics.FactorizedTopK(
         candidates = dataset_candidates.batch(500).map(encoders['utm_model'])
         )
         task = RetrievalCustom(
+        fixed_library_dataset=dataset_candidates,
         metrics=metrics,
-        fixed_library_embeddings = dataset_candidates
+        # num_hard_negatives = 10,
         )   
+
+        # metrics = tfrs.metrics.FactorizedTopK(
+        # candidates = dataset_candidates.batch(500).map(utm_model)
+        # )
+        # task = tfrs.tasks.Retrieval(
+        # metrics=metrics,
+        # num_hard_negatives = 10
+        # ) 
 
         model = retrievalModel(encoders['user_model'], encoders['utm_model'], task)
 
@@ -127,6 +148,14 @@ def run_experiment(params,
         callback_list = [early, tensorboard_callback]
 
 
+        print("Start training the model...")        
+        print(f'num_epochs {num_epochs}')
+        print(f'learning_rate {learning_rate}')
+        print(f'weight_decay {weight_decay}')
+        print(f'batch_size {batch_size}')
+        print(f'train_size {train_size}')
+        print(f'train_size {test_size}')
+
         hist = model.fit(
             dataset_train,
             epochs=params["num_epochs"],
@@ -135,7 +164,9 @@ def run_experiment(params,
             steps_per_epoch=train_size//batch_size,
             validation_steps=(test_size // batch_size)
         )
-     
+      
+        print("Model training finished")
+        print(hist.history)
         loss = hist.history['loss'][-1]
         print(f"Validation loss: {round(loss * 100, 2)}%")
 
@@ -145,41 +176,22 @@ def run_experiment(params,
     return loss, model
 
 
-out_dim=4
-out_activation="sigmoid"
 
-#user encoder
-user_linear_encoder = FTTransformerEncoder(
-    numerical_features = feature_catalog['user_numeric_features'],
-    categorical_features = feature_catalog['user_cat_features'],
-    categorical_data = unique_values_df,
-    embedding_dim=16,
-    depth=4,
-    heads=8,
-    attn_dropout=0.2,
-    ff_dropout=0.2,
-    explainable=True,
-)
+encoders={}
+encoders['user_model'] = user_model
+encoders['utm_model'] = utm_model
 
-#user encoder
-utm_linear_encoder = FTTransformerEncoder(
-    numerical_features = feature_catalog['utm_numeric_features'],
-    categorical_features = feature_catalog['utm_cat_features'],
-    categorical_data = unique_values_df,
-    embedding_dim=16,
-    depth=4,
-    heads=8,
-    attn_dropout=0.2,
-    ff_dropout=0.2,
-    explainable=False,
-)
+
+
+
+
 
 
 space = {
-    'num_epochs': hp.choice('num_epochs', [2, 4]),
+    'num_epochs': hp.choice('num_epochs', [6, 8]),
     'learning_rate': hp.uniform('learning_rate', 0.001, 0.2),
     'weight_decay': hp.uniform('weight_decay', 0, 0.03),
-    'batch_size': hp.choice('batch_size', [10, 50, 1000]),
+    'batch_size': hp.choice('batch_size', [100, 500, 1000]),
 }
 from hyperopt import SparkTrials, STATUS_OK, STATUS_FAIL
 
@@ -204,7 +216,7 @@ train_set_size=train_set.count()
 test_set_size=test_set.count()
 print('train_set_size: ', train_set_size)
 # Number of evaluations
-num_evals = 2
+num_evals = 10
 
 # Trials object to track progress
 trials = Trials()
@@ -232,22 +244,16 @@ print(best_params)
 
 
 
+
+
+from tensorflow_recommenders.tasks import base
+from typing import Optional, Sequence, Union, Text, List
+from tensorflow_recommenders import layers
+from tensorflow_recommenders import metrics as tfrs_metrics
+import abc
+
 class RetrievalCustom(tf.keras.layers.Layer, base.Task):
-  """A factorized retrieval task.
-
-  Recommender systems are often composed of two components:
-  - a retrieval model, retrieving O(thousands) candidates from a corpus of
-    O(millions) candidates.
-  - a ranker model, scoring the candidates retrieved by the retrieval model to
-    return a ranked shortlist of a few dozen candidates.
-
-  This task defines models that facilitate efficient retrieval of candidates
-  from large corpora by maintaining a two-tower, factorized structure: separate
-  query and candidate representation towers, joined at the top via a lightweight
-  scoring function.
-  """
-
-def __init__(self,
+  def __init__(self,
                fixed_library_dataset=None,
                loss: Optional[tf.keras.losses.Loss] = None,
                metrics: Optional[Union[
@@ -299,7 +305,7 @@ def __init__(self,
       value = []
 
     self._factorized_metrics = value
-                           
+    
   def _get_labels_for_fixed_library(self, candidate_embeddings, fixed_library_embeddings_materialized):
     # Compute similarity between batch candidate embeddings and fixed library embeddings
     similarity = tf.linalg.matmul(candidate_embeddings, fixed_library_embeddings_materialized, transpose_b=True)
@@ -309,9 +315,9 @@ def __init__(self,
 
     # Construct the labels matrix
     labels = tf.one_hot(indices, depth=tf.shape(fixed_library_embeddings_materialized)[0])
-    
+
     return labels
-  def call(self,utm_model_encoder,
+  def call(self,fixed_library_embeddings_materialized,
            query_embeddings: tf.Tensor,
            candidate_embeddings: tf.Tensor,
            sample_weight: Optional[tf.Tensor] = None,
@@ -319,8 +325,8 @@ def __init__(self,
            candidate_ids: Optional[tf.Tensor] = None,
            compute_metrics: bool = True,
            compute_batch_metrics: bool = True ) -> tf.Tensor:
-  
-    
+   
+    # Compute similarity with the fixed library
     similarity_with_library = tf.linalg.matmul(query_embeddings, fixed_library_embeddings_materialized, transpose_b=True)
     # print('similarity_with_library ', similarity_with_library.shape())
 
@@ -330,11 +336,12 @@ def __init__(self,
     # Compute the loss
     loss = self._loss(y_true=labels_for_fixed_library, y_pred=similarity_with_library)
 
-
     num_queries = tf.shape(labels_for_fixed_library)[0]
     num_candidates = tf.shape(labels_for_fixed_library)[1]
 
-   
+    # labels = tf.eye(num_queries, num_candidates)
+    # tf.print("labels shape: ", tf.shape(labels))
+
     if self._temperature is not None:
       scores = scores / self._temperature
 
@@ -355,7 +362,9 @@ def __init__(self,
           scores,
           labels)
 
-   update_ops = []
+    # loss = self._loss(y_true=labels, y_pred=scores, sample_weight=sample_weight)
+
+    update_ops = []
     for metric in self._loss_metrics:
       update_ops.append(
           metric.update_state(loss, sample_weight=sample_weight))
@@ -371,6 +380,7 @@ def __init__(self,
                 true_candidate_ids=candidate_ids)
         )
 
+  
     if compute_batch_metrics:
       for metric in self._batch_metrics:
         update_ops.append(metric.update_state(labels, scores))
@@ -379,16 +389,3 @@ def __init__(self,
       return tf.identity(loss)
 
     
-
-user_model = FTTransformer(
-    encoder=user_linear_encoder,
-    out_dim=out_dim,
-    out_activation=out_activation,
-)
-
-
-utm_model = FTTransformer(
-    encoder=utm_linear_encoder,
-    out_dim=out_dim,
-    out_activation=out_activation,
-)
